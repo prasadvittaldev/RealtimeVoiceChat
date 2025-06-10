@@ -1,14 +1,5 @@
-# speech to text and text to speech
-realtimestt==0.3.104
-realtimetts[kokoro,coqui,orpheus]==0.5.5
+# SIP Library
 
-# webserver dependencies
-fastapi
-uvicorn
-
-# configuration
+# Basic app dependencies (if any, keep minimal)
 python-dotenv
-
-# llm providers
-ollama
-openai
+git+https://github.com/tayler6000/pyVoIP.git
