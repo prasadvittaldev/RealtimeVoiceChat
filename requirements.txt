@@ -12,3 +12,8 @@ python-dotenv
 # llm providers
 ollama
 openai
+
+# SIP client gateway dependencies
+websockets
+gTTS
+pjsua2

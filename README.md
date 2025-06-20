@@ -1,4 +1,3 @@
-
 # Real-Time AI Voice Chat 🎤💬🧠🔊
 
 **Have a natural, spoken conversation with an AI!**  
@@ -248,3 +247,86 @@ Got ideas or found a bug? Contributions are welcome! Feel free to open issues or
 The core codebase of this project is released under the **MIT License** (see the [LICENSE](./LICENSE) file for details).
 
 This project relies on external specific TTS engines (like `Coqui XTTSv2`) and LLM providers which have their **own licensing terms**. Please ensure you comply with the licenses of all components you use.
+
+## SIP Gateway Integration
+
+This project includes a SIP gateway (`code/sip_client_gateway.py`) that allows the voice assistant to connect to and interact with standard SIP (Session Initiation Protocol) phone calls. When a SIP call is received by the gateway, it establishes a WebSocket connection to the main FastAPI backend, streaming audio from the SIP call to the backend and playing back the assistant's audio responses into the call.
+
+### Features
+
+- Receives incoming SIP calls.
+- Bi-directional audio streaming with the FastAPI backend over WebSockets.
+- Sends an initial automated greeting to the SIP caller.
+- Leverages the main backend for STT, LLM processing, and TTS.
+
+### Configuration
+
+The SIP gateway is configured using the following environment variables:
+
+-   **`SIP_DOMAIN`**: **Required**. The domain or IP address of your SIP server/provider.
+    *(Example: `sip.example.com`)*
+-   **`SIP_USER`**: **Required**. The username for your SIP account.
+    *(Example: `myuser`)*
+-   **`SIP_PASSWD`**: **Required**. The password for your SIP account.
+    *(Example: `mypassword`)*
+-   **`SIP_BIND_PORT`**: Optional. The local UDP port on which the SIP gateway will listen for incoming SIP traffic.
+    *(Default: `5062`)*
+-   **`WEBSOCKET_URL`**: Optional. The URL of the main FastAPI application's WebSocket endpoint.
+    *(Default: `ws://localhost:8000/ws`)*
+
+### Running the SIP Gateway
+
+To use the SIP gateway, both the main FastAPI server and the SIP gateway script must be running.
+
+1.  **Start the FastAPI Server:**
+    The FastAPI server provides the core voice assistant capabilities. It's typically run using Docker:
+    ```bash
+    docker-compose up -d # Or your usual command to start the main application
+    ```
+    Ensure the server is running and accessible (usually on port 8000).
+
+2.  **Run the SIP Client Gateway:**
+    The SIP gateway script connects to your SIP provider and the FastAPI server.
+
+    **Using Docker (Recommended):**
+    The Docker image built by the provided `Dockerfile` now includes PJSIP and all necessary dependencies for the SIP gateway. To run the gateway within the Docker environment, you would typically add a new service to your `docker-compose.yml` for `sip_client_gateway.py` or run it in a container that has access to the FastAPI server's network.
+
+    *Example (conceptual) addition to a `docker-compose.yml`:*
+    ```yaml
+    services:
+      # ... your existing app service ...
+      sip-gateway:
+        image: <your_app_image_name> # Use the same image if gateway is packaged with app
+        command: ["python", "code/sip_client_gateway.py"]
+        restart: unless-stopped
+        depends_on:
+          - <your_app_service_name> # If your main app service is named e.g., 'app'
+        network_mode: "host" # Or configure specific ports for SIP_BIND_PORT and RTP
+        environment:
+          - SIP_DOMAIN=${SIP_DOMAIN}
+          - SIP_USER=${SIP_USER}
+          - SIP_PASSWD=${SIP_PASSWD}
+          - SIP_BIND_PORT=${SIP_BIND_PORT:-5062}
+          - WEBSOCKET_URL=ws://<your_app_service_name>:8000/ws # e.g., ws://app:8000/ws
+        cap_add:
+          - SYS_NICE # May be needed for PJSIP's real-time audio
+    ```
+    **Note:** `network_mode: "host"` is simpler for direct port access but less secure. Alternatively, map `SIP_BIND_PORT` (UDP) and a range of UDP ports for RTP (e.g., `4000-4020`). PJSIP uses a range of ports for RTP media streams.
+
+    **Running Manually (for development/testing outside Docker):**
+    If you have a local Python environment with PJSIP (`pjsua2`), `websockets`, and `gTTS` installed:
+    ```bash
+    # Set environment variables first
+    export SIP_DOMAIN="your_sip_domain"
+    export SIP_USER="your_sip_user"
+    export SIP_PASSWD="your_sip_password"
+    # export SIP_BIND_PORT="5062" # Optional
+    # export WEBSOCKET_URL="ws://localhost:8000/ws" # Optional
+
+    python code/sip_client_gateway.py
+    ```
+
+### PJSIP Network Configuration Notes
+
+-   **Firewall:** If your machine is behind a firewall, you'll need to allow incoming UDP traffic on the `SIP_BIND_PORT` and the RTP port range used by PJSIP. PJSIP typically uses a range of UDP ports (e.g., 4000-4020 or as configured in `pjlib/include/pj/config_site.h` if you customize PJSIP build) for media (RTP/RTCP).
+-   **NAT Traversal:** SIP and NAT can be complex. If the gateway is behind a NAT router, you might need to configure STUN/TURN in PJSIP (not covered by the current script's basic setup) or use NAT helper features on your router (like SIP ALG, though these can sometimes be problematic). For simpler scenarios, port forwarding the `SIP_BIND_PORT` and RTP ports might work.

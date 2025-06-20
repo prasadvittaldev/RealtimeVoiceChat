@@ -19,6 +19,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-setuptools \
     python3.10-distutils \
     ninja-build \
+    # PJSIP dependencies
+    libasound2-dev \
+    libssl-dev \
+    # End PJSIP dependencies
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
@@ -31,6 +35,43 @@ WORKDIR /app
 
 # Upgrade pip
 RUN pip install --no-cache-dir --upgrade pip
+
+# Download and Compile PJSIP
+ENV PJSIP_VERSION 2.14
+ENV PJSIP_DOWNLOAD_URL https://github.com/pjsip/pjproject/archive/refs/tags/${PJSIP_VERSION}.tar.gz
+WORKDIR /tmp
+RUN curl -sL ${PJSIP_DOWNLOAD_URL} -o pjproject-${PJSIP_VERSION}.tar.gz && \
+    tar -xzf pjproject-${PJSIP_VERSION}.tar.gz && \
+    rm pjproject-${PJSIP_VERSION}.tar.gz && \
+    cd pjproject-${PJSIP_VERSION} && \
+    echo "Configuring PJSIP..." && \
+    ./configure \
+        --prefix=/usr \
+        --enable-shared \
+        --disable-video \
+        --disable-g7221-codec \
+        --disable-gsm-codec \
+        --disable-ilbc-codec \
+        --disable-speex-codec \
+        --disable-l16-codec \
+        --disable-g722-codec \
+        --with-python=/usr/bin/python3.10 CFLAGS='-fPIC -O2' LDFLAGS='-fPIC' && \
+    echo "Building PJSIP dependencies..." && \
+    make dep && \
+    echo "Building PJSIP..." && \
+    make && \
+    echo "Installing PJSIP..." && \
+    make install && \
+    echo "Building and installing PJSIP Python bindings..." && \
+    cd pjsip-apps/src/python && \
+    python3 setup.py install && \
+    # Ensure the .so file is findable by ldconfig if necessary, /usr/lib should be standard
+    ldconfig && \
+    # Clean up PJSIP source to save space
+    cd /tmp && \
+    rm -rf pjproject-${PJSIP_VERSION}
+# Return to /app WORKDIR for subsequent Dockerfile commands
+WORKDIR /app
 
 # Install PyTorch with CUDA 12.1 support
 RUN pip install --no-cache-dir \
