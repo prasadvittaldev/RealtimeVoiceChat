@@ -315,30 +315,47 @@ class MyCall(pj.Call):
             if self.ws_thread and self.ws_thread.is_alive():
                 self.ws_thread.join(timeout=5.0)
 
+            # Clean up audio collector
             if self.audio_collector_media:
-                print(f"*** Call {self.getId()}: Removing audio collector media.", flush=True)
+                print(f"*** Call {self.getId()}: Cleaning up audio collector media.", flush=True)
                 if self.call_media_port:
-                    self.call_media_port.stopTransmit(self.audio_collector_media)
-                self.ep.audDevManager().removeAudioMedia(self.audio_collector_media)
-                self.audio_collector_media = None # Set to None after cleanup
+                    try:
+                        print(f"*** Call {self.getId()}: Stopping transmission from call_media_port to audio_collector_media.", flush=True)
+                        self.call_media_port.stopTransmit(self.audio_collector_media)
+                    except pj.Error as e:
+                        print(f"*** Call {self.getId()}: Error stopping call_media_port transmission to collector: {e}", flush=True)
+                try:
+                    print(f"*** Call {self.getId()}: Removing audio_collector_media from audDevManager.", flush=True)
+                    self.ep.audDevManager().removeAudioMedia(self.audio_collector_media)
+                except pj.Error as e:
+                    print(f"*** Call {self.getId()}: Error removing audio_collector_media: {e}", flush=True)
+                self.audio_collector_media = None
 
             # Clean up audio provider
             if self.audio_provider_media:
-                print(f"*** Call {self.getId()}: Removing audio provider media.", flush=True)
-                # To stop transmitting from provider to call_media_port:
-                # Check if audio_provider_media is still transmitting to call_media_port
-                # This direction is self.audio_provider_media.stopTransmit(self.call_media_port)
-                # However, an AudioMedia that is a source (like AudioFrameProvider) typically doesn't store
-                # who it's transmitting to. The transmission is initiated by the source.
-                # So, we just remove it from audDevManager.
-                self.ep.audDevManager().removeAudioMedia(self.audio_provider_media)
+                print(f"*** Call {self.getId()}: Cleaning up audio provider media.", flush=True)
+                if self.call_media_port: # call_media_port is the sink here
+                    try:
+                        print(f"*** Call {self.getId()}: Stopping transmission from audio_provider_media to call_media_port.", flush=True)
+                        self.audio_provider_media.stopTransmit(self.call_media_port)
+                    except pj.Error as e:
+                        print(f"*** Call {self.getId()}: Error stopping audio_provider_media transmission to call: {e}", flush=True)
+                try:
+                    print(f"*** Call {self.getId()}: Removing audio_provider_media from audDevManager.", flush=True)
+                    self.ep.audDevManager().removeAudioMedia(self.audio_provider_media)
+                except pj.Error as e:
+                    print(f"*** Call {self.getId()}: Error removing audio_provider_media: {e}", flush=True)
                 self.audio_provider_media = None
 
             self.account.remove_call(self)
-            if self.player:
+            if self.player: # This is the old MyAudioMediaPlayer, ensure it's None
                 self.player = None
-            if self.audio_provider_media: # Was audio_player_media
-                self.audio_provider_media = None
+            # Note: self.audio_provider_media was already handled above,
+            # the check `if self.audio_provider_media: # Was audio_player_media` is redundant if it ensures it's set to None.
+            # For safety, ensure it is None if it was the old variable name.
+            # However, since we are consistently using audio_provider_media, this specific line can be removed
+            # if self.audio_provider_media: # Was audio_player_media
+            #    self.audio_provider_media = None
 # Custom AudioMedia to provide frames to PJSIP for playback
 class AudioFrameProvider(pj.AudioMedia):
     def __init__(self, frame_queue, clock_rate=16000, channel_count=1, samples_per_frame=320, bits_per_sample=16):
