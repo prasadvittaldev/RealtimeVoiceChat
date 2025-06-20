@@ -226,7 +226,8 @@ class MyCall(pj.Call):
 
                             # If pcm_data is shorter than a full frame (e.g., end of file), pad with silence
                             if len(pcm_data) < frame_size:
-                                pcm_data += b' ' * (frame_size - len(pcm_data))
+                                padding_needed = frame_size - len(pcm_data)
+                                pcm_data += b'\x00' * padding_needed
 
                             if len(pcm_data) == frame_size: # Ensure it is exactly one frame
                                 timestamp_ms = int(time.time() * 1000)
