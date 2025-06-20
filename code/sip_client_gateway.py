@@ -449,7 +449,10 @@ class MyAccount(pj.Account):
         self.active_calls = []
 
     def onRegState(self, prm):
+        print(f"DEBUG: MyAccount.onRegState: START - code={prm.code}, reason='{prm.reason}', expires={prm.expiration}", flush=True)
+        print(f"DEBUG: MyAccount.onRegState: Original print: *** Registration state: {prm.code} ({prm.reason})", flush=True)
         print(f"*** Registration state: {prm.code} ({prm.reason})", flush=True)
+        print("DEBUG: MyAccount.onRegState: END", flush=True)
 
     def onIncomingCall(self, prm):
         call = MyCall(self, call_id=prm.callId)
@@ -467,40 +470,82 @@ class MyAccount(pj.Account):
 
 # --- Main script execution ---
 def main():
+    print("DEBUG: Starting main()", flush=True)
+    print("DEBUG: About to create pj.Endpoint()", flush=True)
     ep = pj.Endpoint()
-    ep.libCreate()
-    ep_cfg = pj.EpConfig()
-    ep.libInit(ep_cfg)
-    ep.audDevManager().setNullDev()
+    print(f"DEBUG: pj.Endpoint() created: {type(ep)}", flush=True)
 
+    print("DEBUG: About to call ep.libCreate()", flush=True)
+    ep.libCreate()
+    print("DEBUG: ep.libCreate() returned", flush=True)
+
+    print("DEBUG: About to create pj.EpConfig()", flush=True)
+    ep_cfg = pj.EpConfig()
+    print("DEBUG: pj.EpConfig() created", flush=True)
+
+    # Configure logging
+    ep_cfg.logConfig.level = 5  # Set PJSIP library log level (e.g., 5 for verbose)
+    ep_cfg.logConfig.consoleLevel = 5 # Set PJSIP console log level
+    # Optionally, you could also set ep_cfg.logConfig.filename for file logging
+    # ep_cfg.logConfig.writer = CustomLogWriter() # For custom log handling if needed
+    print("*** PJSIP log level set to 5 (consoleLevel 5)", flush=True)
+
+    print("DEBUG: About to call ep.libInit()", flush=True)
+    ep.libInit(ep_cfg)
+    print("DEBUG: ep.libInit() returned", flush=True)
+
+    print("DEBUG: About to call ep.audDevManager().setNullDev()", flush=True)
+    ep.audDevManager().setNullDev()
+    print("DEBUG: ep.audDevManager().setNullDev() returned", flush=True)
+
+    print("DEBUG: About to create pj.TransportConfig() for UDP", flush=True)
     sipTpConfig = pj.TransportConfig()
     sipTpConfig.port = SIP_BIND_PORT
-    ep.transportCreate(pj.PJSIP_TRANSPORT_UDP, sipTpConfig)
-    ep.libStart()
+    print(f"DEBUG: pj.TransportConfig() created for UDP on port {sipTpConfig.port}", flush=True)
 
+    print("DEBUG: About to call ep.transportCreate(UDP)", flush=True)
+    ep.transportCreate(pj.PJSIP_TRANSPORT_UDP, sipTpConfig)
+    print("DEBUG: ep.transportCreate(UDP) returned", flush=True)
+
+    print("DEBUG: About to call ep.libStart()", flush=True)
+    ep.libStart()
+    print("DEBUG: ep.libStart() returned", flush=True)
+
+    print("DEBUG: About to create pj.AccountConfig()", flush=True)
     acc_cfg = pj.AccountConfig()
     acc_cfg.idUri = f"sip:{SIP_USER}@{SIP_DOMAIN}"
     acc_cfg.regConfig.registrarUri = f"sip:{SIP_DOMAIN}"
     cred = pj.AuthCredInfo("digest", "*", SIP_USER, 0, SIP_PASSWD)
     acc_cfg.sipConfig.authCreds.append(cred)
+    print(f"DEBUG: pj.AccountConfig created for {acc_cfg.idUri}", flush=True)
 
+    print("DEBUG: About to create MyAccount()", flush=True)
     acc = MyAccount()
+    print("DEBUG: MyAccount() created", flush=True)
+
+    print("DEBUG: About to call acc.create()", flush=True)
     acc.create(acc_cfg)
+    print("DEBUG: acc.create() returned", flush=True)
 
     print("*** SIP bot is running. Waiting for incoming calls... (Press Ctrl+C to stop)", flush=True)
 
     try:
         while True:
+            print("DEBUG: Main loop: Top of loop, before libHandleEvents()", flush=True)
             ep.libHandleEvents(20) # Check events every 20ms
             time.sleep(0.01) # Prevent busy loop, give some time back to OS
+            print("DEBUG: Main loop: Bottom of loop, after libHandleEvents() and sleep", flush=True)
     except KeyboardInterrupt:
         print("\nExiting...", flush=True)
     finally:
         # Cleanly destroy the library
         # This will also trigger necessary cleanup for calls and account
         if ep:
+            print("DEBUG: Main finally block: About to call ep.libDestroy()", flush=True)
             print("Shutting down PJSIP library...", flush=True)
             ep.libDestroy()
+            print("DEBUG: ep.libDestroy() returned", flush=True)
+            print("DEBUG: Main finally block: ep set to None", flush=True)
             ep = None # Clear the reference
 
     print("Shutdown complete.", flush=True)
