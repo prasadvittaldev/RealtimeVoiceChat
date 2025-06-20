@@ -350,7 +350,7 @@ class AudioFrameProvider(pj.AudioMedia):
         self._bits_per_sample = bits_per_sample
         self.ep = pj.Endpoint.instance()
         # Create a silent frame for underflow
-        self.silent_frame_data = b' ' * (samples_per_frame * channel_count * (bits_per_sample // 8))
+        self.silent_frame_data = b'\x00' * (samples_per_frame * channel_count * (bits_per_sample // 8))
 
     def getPortInfo(self):
         pi = pj.MediaPortInfo()
