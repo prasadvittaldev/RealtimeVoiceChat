@@ -1,38 +1,71 @@
-# Remove the version: '3.8' line as per the warning
+version: '3.8' # Adding a version for clarity, though Docker Compose v2+ doesn't strictly need it at top level for simple files.
+
 services:
   # Your FastAPI Application Service
   app:
-    build: . # Build the image using the SIMPLIFIED Dockerfile
-    image: realtime-voice-chat:latest # Name the image built by 'build:'
+    build:
+      context: .
+      dockerfile: Dockerfile # Explicitly state the Dockerfile
+    image: realtime-voice-chat-app:latest # Consistent naming
     container_name: realtime-voice-chat-app
     ports:
       - "8000:8000"
     environment:
       # Point to the 'ollama' service
       - OLLAMA_BASE_URL=http://ollama:11434
+      # Baresip Host for server.py
+      - BARESIP_CTRL_TCP_HOST=baresip
       # --- Other App Environment Variables ---
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - MAX_AUDIO_QUEUE_SIZE=${MAX_AUDIO_QUEUE_SIZE:-50}
-      - NVIDIA_VISIBLE_DEVICES=all # For app's PyTorch/DeepSpeed/etc
+      - NVIDIA_VISIBLE_DEVICES=${NVIDIA_VISIBLE_DEVICES:-all} # Allow override, default to all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
       - HF_HOME=/home/appuser/.cache/huggingface
       - TORCH_HOME=/home/appuser/.cache/torch
+      - PYTHONUNBUFFERED=1 # Already in Dockerfile, but good to have here too
+      # Pass through FIFO paths if they need to be configurable via compose, though server.py has defaults
+      # - BARESIP_AUDIO_FROM_SIP_FIFO=/run/baresip_fifos/audio_from_sip.fifo
+      # - BARESIP_AUDIO_TO_SIP_FIFO=/run/baresip_fifos/audio_to_sip.fifo
     volumes:
-       # Optional: Mount code for live development
-       # - ./code:/app/code
+       # Mount code for live development
+       - ./code:/app/code
+       - ./static:/app/static
        # Mount cache directories
        - huggingface_cache:/home/appuser/.cache/huggingface
        - torch_cache:/home/appuser/.cache/torch
+       # Mount shared FIFO volume
+       - baresip_fifos_vol:/run/baresip_fifos
     depends_on:
-    - ollama
+      - ollama
+      - baresip # Added dependency on Baresip
     deploy: # GPU access for the app
       resources:
         reservations:
           devices:
             - driver: nvidia
-              count: all
+              count: all # Or specify a number e.g., "1"
               capabilities: [gpu, compute, utility]
     restart: unless-stopped
+    networks:
+      - voicechat_net
+
+  # Baresip Service
+  baresip:
+    build:
+      context: .
+      dockerfile: Dockerfile.baresip
+    image: realtime-voice-chat-baresip:latest
+    container_name: realtime-voice-chat-baresip
+    ports:
+      - "5062:5062/udp"
+      - "5062:5062/tcp"
+      - "4444:4444" # For ctrl_tcp debugging from host if needed
+    volumes:
+      - ./baresip_config:/etc/baresip # Mount Baresip's own config
+      - baresip_fifos_vol:/run/baresip_fifos # Mount shared FIFO volume
+    restart: unless-stopped
+    networks:
+      - voicechat_net
 
   # Ollama Server Service (Using Official Image)
   ollama:
@@ -73,3 +106,9 @@ volumes:
     driver: local
   torch_cache:
     driver: local
+  baresip_fifos_vol: # Named volume for FIFOs
+    driver: local
+
+networks:
+  voicechat_net:
+    driver: bridge

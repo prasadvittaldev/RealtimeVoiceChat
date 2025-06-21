@@ -1,0 +1,136 @@
+# Baresip main configuration file
+
+# Core
+poll_method             epoll   # epoll, select, poll etc.
+
+# SIP
+sip_listen              0.0.0.0:5062
+#sip_certificate         cert.pem # For TLS, if needed
+
+# Call
+call_max_calls          4
+
+# Audio
+audio_player            fifo,/run/baresip_fifos/audio_from_sip.fifo,L16/16000/1
+audio_source            fifo,/run/baresip_fifos/audio_to_sip.fifo,L16/16000/1
+audio_alert             alsa,default # Or use "null" if no local alert sound is needed
+#audio_channels         1 # Mono by default for calls
+#audio_srate            8000-48000 # Supported sample rates
+ausrc_format            L16 # Default format for ausrc/auplay if not specified in path
+auplay_format           L16 # Default format for ausrc/auplay if not specified in path
+audio_txmode            poll    # poll, thread
+audio_rxmode            poll    # poll, thread
+#opus_bitrate           28000   # Opus target bitrate in bits/s
+#opus_cbr               no      # Constant Bit Rate
+#opus_stereo            no
+#opus_sprop_stereo      no
+#opus_application       audio   # audio|voip|restricted_lowdelay
+#opus_samplerate        48000   # Internal Opus sample rate
+
+# Video (can be disabled if not needed)
+#video_source           null
+#video_display          null
+#video_size             cif     # cif, qcif, vga, 720p, 1080p etc.
+#video_bitrate          512000  # bits/s
+#video_fps              30.0    # frames/s
+
+# AVT - Audio/Video Transport
+rtp_tos                 184
+#rtp_ports              10000-20000 # RTP port range
+#rtp_bandwidth          512-1024 # RTP bandwidth in kbit/s [min-max]
+#rtcp_enable            yes
+#rtcp_mux               no      # RTP/RTCP multiplexing
+#jitter_buffer_enable   yes     # Adaptive jitter buffer
+#jitter_buffer_type     adaptive # adaptive, fixed
+#jitter_buffer_delay    5-10    # Jitter buffer delay in [ms] (min-max)
+#rtp_timeout            60      # RTP Timeout in seconds
+
+# Network
+#net_interface          eth0
+
+# NAT Traversal (if needed)
+#natbd_server           myturnserver.com
+#natbd_interval         600     # NAT binding refresh interval in [seconds]
+#stun_server            stun:stun.l.google.com:19302 # Example STUN server
+
+# Modules
+module_path             /usr/lib/baresip/modules # Adjust if Baresip modules are elsewhere
+
+# Standard modules
+module                  stdio.so
+module                  ctrl_tcp.so
+module                  account.so
+module                  contact.so
+module                  debug_cmd.so
+module                  echo.so
+module                  menu.so
+module                  uuid.so
+module                  stun.so
+module                  turn.so
+module                  ice.so
+#module                 cons.so # Console UI, not needed for headless
+
+# Audio codec modules (order determines preference if not specified in account)
+module                  opus.so
+module                  g722.so
+module                  g711.so # For PCMA/PCMU
+module                  l16.so  # Raw L16 - important for FIFO if Baresip itself doesn't convert
+#module                 mpa.so # MPEG audio (MP3)
+#module                 gsm.so
+#module                 speex.so
+#module                 bv32.so
+
+# Audio driver modules
+#module                 alsa.so # For physical sound card, if needed as fallback or for alerts
+module                 fifo.so # For FIFO pipe audio I/O
+#module                 nullsound.so # Null audio driver
+#module                 portaudio.so
+#module                 sndfile.so # For reading/writing audio files
+
+# Video codec modules (examples, can be removed if no video)
+#module                 avcodec.so # FFmpeg/Libav video codecs
+#module                 v4l2.so    # Video4Linux2 source
+#module                 x11.so     # X11 display
+
+#------------------------------------------------------------------------------
+# Module specific configuration
+#------------------------------------------------------------------------------
+
+# ctrl_tcp
+ctrl_tcp_listen         0.0.0.0:4444
+
+# Account file
+accounts_file           /etc/baresip/accounts.txt # Path inside the container
+
+# Console - if cons.so is loaded
+# cons_listen            0.0.0.0:5555
+
+# HTTPd - if httpd.so is loaded
+# http_listen            0.0.0.0:8000
+# http_root              /usr/share/baresip/httpd_root
+
+# Opus codec
+opus_bitrate            64000 # Example: 64kbps
+opus_stereo             no
+opus_sprop_stereo       no
+
+# Speex codec (if used)
+# speex_quality          7 # 0-10
+# speex_complexity       7 # 0-10
+# speex_enhancement      yes
+# speex_mode_id          any
+# speex_vbr              no
+# speex_abr              0
+# speex_dtx              no
+
+# Selfview (for video calls, if applicable)
+# selfview_window_title  Baresip Selfview
+# selfview_size          200x150 # width x height
+# selfview_aspect_ratio  no # yes|no
+# selfview_border        yes # yes|no
+# selfview_hide_on_menu_open yes # yes|no
+# selfview_position      top_right # top_left|top_right|bottom_left|bottom_right
+# selfview_x_offset      0
+# selfview_y_offset      0
+
+# EOF

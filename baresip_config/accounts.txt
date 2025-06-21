@@ -1,0 +1,16 @@
+# Baresip accounts file
+#
+# Format:
+# <sip:user@domain;uri-params>;auth_pass=secret;params
+#
+# Example:
+# <sip:alice@example.com>;auth_pass=secretpassword;regint=600
+# <sip:bob@192.168.1.100:5060>;auth_pass=anothersecret;answermode=auto
+#
+# Placeholder - replace with your actual SIP account details:
+<sip:your_username@your_sip_provider.com>;auth_pass=your_password;regint=300;audio_codecs=opus,pcmu,pcma,L16/16000
+# The L16/16000 codec might be useful for direct FIFO interaction if Baresip
+# is configured to pass it through without its own resampling for the FIFO.
+# However, typically Opus/G711 are used over the wire and Baresip decodes to L16 for the FIFO.
+# Ensure your SIP provider/PBX supports the codecs you list.
+# EOF

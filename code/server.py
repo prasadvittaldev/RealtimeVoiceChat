@@ -56,10 +56,10 @@ if __name__ == "__main__":
 # Baresip Configuration
 BARESIP_EXECUTABLE = os.getenv("BARESIP_EXECUTABLE", "baresip")  # Or full path
 BARESIP_CONFIG_PATH = os.getenv("BARESIP_CONFIG_PATH", "~/.baresip") # Or a path within the project for bundled config
-BARESIP_CTRL_TCP_HOST = os.getenv("BARESIP_CTRL_TCP_HOST", "127.0.0.1")
+BARESIP_CTRL_TCP_HOST = os.getenv("BARESIP_CTRL_TCP_HOST", "baresip") # Changed for Docker service discovery
 BARESIP_CTRL_TCP_PORT = int(os.getenv("BARESIP_CTRL_TCP_PORT", 4444))
-BARESIP_AUDIO_FROM_SIP_FIFO = os.getenv("BARESIP_AUDIO_FROM_SIP_FIFO", "/tmp/baresip_audio_from_sip.fifo")
-BARESIP_AUDIO_TO_SIP_FIFO = os.getenv("BARESIP_AUDIO_TO_SIP_FIFO", "/tmp/baresip_audio_to_sip.fifo")
+BARESIP_AUDIO_FROM_SIP_FIFO = os.getenv("BARESIP_AUDIO_FROM_SIP_FIFO", "/run/baresip_fifos/audio_from_sip.fifo") # Updated for Docker volume
+BARESIP_AUDIO_TO_SIP_FIFO = os.getenv("BARESIP_AUDIO_TO_SIP_FIFO", "/run/baresip_fifos/audio_to_sip.fifo")     # Updated for Docker volume
 SIP_AUDIO_SAMPLE_RATE = int(os.getenv("SIP_AUDIO_SAMPLE_RATE", 16000))
 SIP_AUDIO_CHANNELS = int(os.getenv("SIP_AUDIO_CHANNELS", 1))
 # For Baresip config, L16 is signed 16-bit little-endian PCM
@@ -117,38 +117,35 @@ class BaresipManager:
         logger.info("🖥️📞 Starting BaresipManager...")
         await self._create_fifos()
 
-        baresip_command = [
-            BARESIP_EXECUTABLE,
-            "-f", os.path.expanduser(BARESIP_CONFIG_PATH),
-            # Example: Add verbosity or specific modules if needed via -e
-            # "-e", "/log_level 4", # Increase log level if baresip supports it
-        ]
-        # It's generally better to configure FIFO paths directly in Baresip's config file
-        # rather than command line, but this is an option if needed:
-        # baresip_command.extend([
-        #     f"-e /auplay fifo,{BARESIP_AUDIO_FROM_SIP_FIFO},{SIP_AUDIO_FORMAT_STR}",
-        #     f"-e /ausrc fifo,{BARESIP_AUDIO_TO_SIP_FIFO},{SIP_AUDIO_FORMAT_STR}",
-        # ])
+        running_in_docker = os.getenv("RUNNING_IN_DOCKER", "false").lower() == "true"
 
-        try:
-            self.process = await asyncio.create_subprocess_exec(
-                *baresip_command,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            logger.info(f"🖥️📞 Baresip process started (PID: {self.process.pid}).")
+        if not running_in_docker:
+            logger.info("🖥️📞 Not running in Docker (or RUNNING_IN_DOCKER not true), will attempt to start Baresip process locally.")
+            baresip_command = [
+                BARESIP_EXECUTABLE,
+                "-f", os.path.expanduser(BARESIP_CONFIG_PATH),
+            ]
+            try:
+                self.process = await asyncio.create_subprocess_exec(
+                    *baresip_command,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                logger.info(f"🖥️📞 Local Baresip process started (PID: {self.process.pid}).")
+                self._ctrl_tasks.append(asyncio.create_task(self._log_stream(self.process.stdout, "Baresip STDOUT")))
+                self._ctrl_tasks.append(asyncio.create_task(self._log_stream(self.process.stderr, "Baresip STDERR")))
+            except FileNotFoundError:
+                logger.error(f"🖥️💥 Baresip executable '{BARESIP_EXECUTABLE}' not found for local execution. Please check path or install Baresip.")
+                return
+            except Exception as e:
+                logger.error(f"🖥️💥 Failed to start local Baresip process: {e}")
+                return
+        else:
+            logger.info("🖥️📞 Running in Docker, assuming Baresip is a separate service. Skipping local Baresip process start.")
 
-            self._ctrl_tasks.append(asyncio.create_task(self._log_stream(self.process.stdout, "Baresip STDOUT")))
-            self._ctrl_tasks.append(asyncio.create_task(self._log_stream(self.process.stderr, "Baresip STDERR")))
-
-        except FileNotFoundError:
-            logger.error(f"🖥️💥 Baresip executable '{BARESIP_EXECUTABLE}' not found. Please check path or install Baresip.")
-            return
-        except Exception as e:
-            logger.error(f"🖥️💥 Failed to start Baresip: {e}")
-            return
-
-        await asyncio.sleep(2) # Give Baresip time to initialize
+        # Wait for Baresip to initialize, especially if it's a separate service
+        # This might need adjustment depending on how quickly Baresip starts in its container.
+        await asyncio.sleep(os.getenv("BARESIP_CONNECT_DELAY", 5)) # Increased delay for Docker Compose startup
 
         try:
             logger.info(f"🖥️📞 Attempting to connect to Baresip ctrl_tcp at {BARESIP_CTRL_TCP_HOST}:{BARESIP_CTRL_TCP_PORT}")
@@ -356,19 +353,22 @@ class BaresipManager:
                 logger.warning(f"Error closing ctrl_writer: {e}")
         self.ctrl_reader = None # Reader task handles its closure or EOF
 
-        if self.process and self.process.returncode is None:
-            logger.info(f"🖥️📞 Terminating Baresip process (PID: {self.process.pid})...")
+        running_in_docker = os.getenv("RUNNING_IN_DOCKER", "false").lower() == "true"
+        if not running_in_docker and self.process and self.process.returncode is None:
+            logger.info(f"🖥️📞 Terminating local Baresip process (PID: {self.process.pid})...")
             try:
                 self.process.terminate() # SIGTERM
                 await asyncio.wait_for(self.process.wait(), timeout=5.0)
-                logger.info(f"🖥️📞 Baresip process (PID: {self.process.pid}) terminated with code {self.process.returncode}.")
+                logger.info(f"🖥️📞 Local Baresip process (PID: {self.process.pid}) terminated with code {self.process.returncode}.")
             except asyncio.TimeoutError:
-                logger.warning(f"🖥️📞 Baresip process (PID: {self.process.pid}) did not terminate gracefully, killing (SIGKILL).")
+                logger.warning(f"🖥️📞 Local Baresip process (PID: {self.process.pid}) did not terminate gracefully, killing (SIGKILL).")
                 self.process.kill()
                 await self.process.wait()
-                logger.info(f"🖥️📞 Baresip process (PID: {self.process.pid}) killed with code {self.process.returncode}.")
+                logger.info(f"🖥️📞 Local Baresip process (PID: {self.process.pid}) killed with code {self.process.returncode}.")
             except Exception as e: # Catch other potential errors like ProcessLookupError
-                logger.error(f"🖥️💥 Error terminating Baresip process (PID: {self.process.pid if self.process else 'unknown'}): {e}")
+                logger.error(f"🖥️💥 Error terminating local Baresip process (PID: {self.process.pid if self.process else 'unknown'}): {e}")
+        elif running_in_docker:
+            logger.info("🖥️📞 Running in Docker, Baresip process is managed externally (by Docker Compose).")
 
         # FIFO cleanup is better handled by the system or on next start if needed,
         # as other processes might still be using them if Baresip didn't close them.

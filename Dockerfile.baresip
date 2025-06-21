@@ -1,0 +1,45 @@
+# Dockerfile for Baresip Service
+
+FROM debian:bullseye-slim
+
+# Avoid prompts during package installation
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install Baresip and common modules
+# baresip-std usually includes common modules like ctrl_tcp, account, fifo, opus, g711 etc.
+# Add other baresip-* packages if specific modules are needed and not in baresip-std
+# e.g., baresip-ffmpeg for avformat module if that was chosen for audio
+# Ensure the chosen Debian version has recent enough Baresip packages or consider building from source.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    baresip \
+    baresip-std \
+    # Add other specific baresip modules if needed, e.g., baresip-opus, baresip-g711
+    # For this setup, fifo and ctrl_tcp are key, usually in baresip-std or core.
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create directory for FIFO pipes (will be a mount point for a shared volume)
+# Ensure this path matches what's used in baresip_config/config and server.py
+RUN mkdir -p /run/baresip_fifos && \
+    chown -R nobody:nogroup /run/baresip_fifos # Run baresip as non-root if possible
+
+# Baresip configuration will be mounted to /etc/baresip/
+# Baresip will also need to write to /tmp for some operations, or other configured paths.
+
+# Expose SIP port (UDP and TCP) and ctrl_tcp port
+EXPOSE 5062/udp
+EXPOSE 5062/tcp
+EXPOSE 4444/tcp
+
+# Default command to run Baresip
+# -f /etc/baresip/config: Use the mounted config file
+# -v: Verbose logging. Add more 'v' for more verbosity (e.g., -vv)
+# The accounts_file directive within the main config file should point to /etc/baresip/accounts.txt
+# We can also specify it via -e /accounts_file /etc/baresip/accounts.txt if needed,
+# but it's cleaner in the main config.
+# Running as nobody:nogroup for reduced privileges, if Baresip supports it well.
+# This requires /etc/baresip and /run/baresip_fifos to be accessible by this user.
+# If running as non-root causes issues, remove "USER nobody" and adjust chown above.
+# USER nobody:nogroup
+
+CMD ["baresip", "-f", "/etc/baresip/config", "-v"]

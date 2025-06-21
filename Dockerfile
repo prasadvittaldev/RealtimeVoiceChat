@@ -62,6 +62,7 @@ RUN pip install --no-cache-dir "ctranslate2<4.5.0"
 
 # Copy the application code
 COPY --chown=1001:1001 code/ ./code/
+COPY --chown=1001:1001 static/ ./static/ # Added static files
 
 # --- Stage 2: Runtime Stage ---
 # Base image still needs CUDA toolkit for PyTorch/DeepSpeed/etc in the app
@@ -101,6 +102,7 @@ COPY --chown=1001:1001 --from=builder /usr/local/lib/python3.10/dist-packages /u
 
 # Copy the application code from the builder stage
 COPY --chown=1001:1001 --from=builder /app/code /app/code
+COPY --chown=1001:1001 --from=builder /app/static /app/static # Added static files
 
 # <<<--- Keep other model pre-downloads --->>>
 # <<<--- Silero VAD Pre-download --->>>
