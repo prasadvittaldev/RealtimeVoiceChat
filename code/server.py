@@ -18,8 +18,15 @@ import time
 import threading # Keep threading for SpeechPipelineManager internals and AbortWorker
 import sys
 import os # Added for environment variable access
+import subprocess # For managing Baresip process
+import socket # For ctrl_tcp communication (if not using asyncio.open_connection directly for everything)
+import re # For parsing Baresip ctrl_tcp responses if needed (though JSON is preferred)
+import stat # For S_ISFIFO checks
+import base64 # For encoding SIP audio chunks for WebSocket
+import threading # For AudioBridge and AbortWorker
+from queue import Empty as QueueEmpty # For AudioBridge queue.get timeout
 
-from typing import Any, Dict, Optional, Callable # Added for type hints in docstrings
+from typing import Any, Dict, Optional, Callable, Awaitable # Added for type hints in docstrings
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -46,6 +53,18 @@ if __name__ == "__main__":
     logger.info(f"🖥️⚙️ {Colors.apply('[PARAM]').blue} Starting engine: {Colors.apply(TTS_START_ENGINE).blue}")
     logger.info(f"🖥️⚙️ {Colors.apply('[PARAM]').blue} Direct streaming: {Colors.apply('ON' if DIRECT_STREAM else 'OFF').blue}")
 
+# Baresip Configuration
+BARESIP_EXECUTABLE = os.getenv("BARESIP_EXECUTABLE", "baresip")  # Or full path
+BARESIP_CONFIG_PATH = os.getenv("BARESIP_CONFIG_PATH", "~/.baresip") # Or a path within the project for bundled config
+BARESIP_CTRL_TCP_HOST = os.getenv("BARESIP_CTRL_TCP_HOST", "127.0.0.1")
+BARESIP_CTRL_TCP_PORT = int(os.getenv("BARESIP_CTRL_TCP_PORT", 4444))
+BARESIP_AUDIO_FROM_SIP_FIFO = os.getenv("BARESIP_AUDIO_FROM_SIP_FIFO", "/tmp/baresip_audio_from_sip.fifo")
+BARESIP_AUDIO_TO_SIP_FIFO = os.getenv("BARESIP_AUDIO_TO_SIP_FIFO", "/tmp/baresip_audio_to_sip.fifo")
+SIP_AUDIO_SAMPLE_RATE = int(os.getenv("SIP_AUDIO_SAMPLE_RATE", 16000))
+SIP_AUDIO_CHANNELS = int(os.getenv("SIP_AUDIO_CHANNELS", 1))
+# For Baresip config, L16 is signed 16-bit little-endian PCM
+SIP_AUDIO_FORMAT_STR = f"L16/{SIP_AUDIO_SAMPLE_RATE}/{SIP_AUDIO_CHANNELS}"
+
 # Define the maximum allowed size for the incoming audio queue
 try:
     MAX_AUDIO_QUEUE_SIZE = int(os.getenv("MAX_AUDIO_QUEUE_SIZE", 50))
@@ -69,6 +88,464 @@ from colors import Colors
 LANGUAGE = "en"
 # TTS_FINAL_TIMEOUT = 0.5 # unsure if 1.0 is needed for stability
 TTS_FINAL_TIMEOUT = 1.0 # unsure if 1.0 is needed for stability
+
+
+# --------------------------------------------------------------------
+# Baresip Manager Class
+# --------------------------------------------------------------------
+class BaresipManager:
+    def __init__(self, app_state: Any, loop: asyncio.AbstractEventLoop):
+        self.app_state = app_state
+        self.loop = loop
+        self.process: Optional[asyncio.subprocess.Process] = None
+        self.ctrl_reader: Optional[asyncio.StreamReader] = None
+        self.ctrl_writer: Optional[asyncio.StreamWriter] = None
+        self.command_queue: asyncio.Queue[Optional[str]] = asyncio.Queue() # To send commands to Baresip from other tasks
+        self.active_sip_calls: Dict[str, Dict[str, Any]] = {} # call_id -> call_info
+        self.on_incoming_call_callback: Optional[Callable[[str, str], Awaitable[None]]] = None # (call_id, remote_uri)
+        self.on_call_established_callback: Optional[Callable[[str], Awaitable[None]]] = None # (call_id)
+        self.on_call_closed_callback: Optional[Callable[[str], Awaitable[None]]] = None # (call_id)
+        self._stop_event = asyncio.Event()
+        self._ctrl_tasks: list[asyncio.Task] = []
+
+
+    async def start(self):
+        """Starts Baresip subprocess and connects to its ctrl_tcp interface."""
+        if self._stop_event.is_set():
+            self._stop_event.clear() # Allow restarting if previously stopped
+
+        logger.info("🖥️📞 Starting BaresipManager...")
+        await self._create_fifos()
+
+        baresip_command = [
+            BARESIP_EXECUTABLE,
+            "-f", os.path.expanduser(BARESIP_CONFIG_PATH),
+            # Example: Add verbosity or specific modules if needed via -e
+            # "-e", "/log_level 4", # Increase log level if baresip supports it
+        ]
+        # It's generally better to configure FIFO paths directly in Baresip's config file
+        # rather than command line, but this is an option if needed:
+        # baresip_command.extend([
+        #     f"-e /auplay fifo,{BARESIP_AUDIO_FROM_SIP_FIFO},{SIP_AUDIO_FORMAT_STR}",
+        #     f"-e /ausrc fifo,{BARESIP_AUDIO_TO_SIP_FIFO},{SIP_AUDIO_FORMAT_STR}",
+        # ])
+
+        try:
+            self.process = await asyncio.create_subprocess_exec(
+                *baresip_command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            logger.info(f"🖥️📞 Baresip process started (PID: {self.process.pid}).")
+
+            self._ctrl_tasks.append(asyncio.create_task(self._log_stream(self.process.stdout, "Baresip STDOUT")))
+            self._ctrl_tasks.append(asyncio.create_task(self._log_stream(self.process.stderr, "Baresip STDERR")))
+
+        except FileNotFoundError:
+            logger.error(f"🖥️💥 Baresip executable '{BARESIP_EXECUTABLE}' not found. Please check path or install Baresip.")
+            return
+        except Exception as e:
+            logger.error(f"🖥️💥 Failed to start Baresip: {e}")
+            return
+
+        await asyncio.sleep(2) # Give Baresip time to initialize
+
+        try:
+            logger.info(f"🖥️📞 Attempting to connect to Baresip ctrl_tcp at {BARESIP_CTRL_TCP_HOST}:{BARESIP_CTRL_TCP_PORT}")
+            self.ctrl_reader, self.ctrl_writer = await asyncio.open_connection(
+                BARESIP_CTRL_TCP_HOST, BARESIP_CTRL_TCP_PORT
+            )
+            logger.info("🖥️📞 Connected to Baresip ctrl_tcp interface.")
+            self._ctrl_tasks.append(asyncio.create_task(self._ctrl_reader_task()))
+            self._ctrl_tasks.append(asyncio.create_task(self._ctrl_writer_task()))
+        except ConnectionRefusedError:
+            logger.error(f"🖥️💥 Baresip ctrl_tcp connection refused at {BARESIP_CTRL_TCP_HOST}:{BARESIP_CTRL_TCP_PORT}. Is Baresip running and ctrl_tcp module loaded and configured?")
+        except Exception as e:
+            logger.error(f"🖥️💥 Error connecting to Baresip ctrl_tcp: {e}")
+
+    async def _log_stream(self, stream: Optional[asyncio.StreamReader], prefix: str):
+        if not stream: return
+        try:
+            while not stream.at_eof():
+                line = await stream.readline()
+                if line:
+                    logger.info(f"🖥️📞 [{prefix}] {line.decode(errors='ignore').strip()}")
+                else:
+                    break
+        except asyncio.CancelledError:
+            logger.info(f"🖥️📞 Log stream task for {prefix} cancelled.")
+        except Exception as e:
+            logger.error(f"🖥️💥 Error in log stream {prefix}: {e}")
+
+
+    async def _create_fifos(self):
+        logger.info(f"🖥️📞 Ensuring FIFOs exist: {BARESIP_AUDIO_FROM_SIP_FIFO}, {BARESIP_AUDIO_TO_SIP_FIFO}")
+        for fifo_path_str in [BARESIP_AUDIO_FROM_SIP_FIFO, BARESIP_AUDIO_TO_SIP_FIFO]:
+            fifo_path = os.path.expanduser(fifo_path_str)
+            if not os.path.exists(fifo_path):
+                try:
+                    os.mkfifo(fifo_path)
+                    logger.info(f"🖥️📞 Created FIFO: {fifo_path}")
+                except OSError as e:
+                    logger.error(f"🖥️💥 Failed to create FIFO {fifo_path}: {e}. Check permissions and path.")
+            else:
+                try:
+                    if not stat.S_ISFIFO(os.stat(fifo_path).st_mode):
+                        logger.error(f"🖥️💥 {fifo_path} exists but is not a FIFO. Please remove it or use a different path.")
+                    else:
+                        logger.info(f"🖥️📞 FIFO {fifo_path} already exists.")
+                except Exception as e:
+                     logger.error(f"🖥️💥 Error checking status of {fifo_path}: {e}")
+
+
+    async def _ctrl_reader_task(self):
+        if not self.ctrl_reader: return
+        logger.info("🖥️📞 Baresip ctrl_reader_task started.")
+        try:
+            while not self._stop_event.is_set() and self.ctrl_reader and not self.ctrl_reader.at_eof():
+                line = await self.ctrl_reader.readline()
+                if not line:
+                    logger.warning("🖥️📞 Baresip ctrl_tcp connection closed by Baresip (EOF).")
+                    break
+                message = line.decode().strip()
+                if message:
+                    logger.debug(f"🖥️📞 Baresip Event RAW: {message}")
+                    try:
+                        event = json.loads(message)
+                        await self._handle_baresip_event(event)
+                    except json.JSONDecodeError:
+                        # Baresip ctrl_tcp can also send non-JSON status messages on command responses
+                        logger.debug(f"🖥️📞 Non-JSON message from Baresip ctrl_tcp (possibly command response): {message}")
+        except asyncio.CancelledError:
+            logger.info("🖥️📞 Baresip ctrl_reader_task cancelled.")
+        except ConnectionResetError:
+            logger.warning("🖥️📞 Baresip ctrl_tcp connection reset.")
+        except Exception as e:
+            logger.error(f"🖥️💥 Error in Baresip ctrl_reader_task: {e}", exc_info=True)
+        finally:
+            logger.info("🖥️📞 Baresip ctrl_reader_task finished.")
+            # Ensure other tasks are signalled to stop if the reader fails or connection drops
+            await self.stop()
+
+
+    async def _handle_baresip_event(self, event: Dict[str, Any]):
+        # This will be expanded in a later iteration
+        event_type = event.get("type")
+        call_id = event.get("id")
+        param = event.get("param")
+        logger.info(f"🖥️📞 Parsed Baresip Event: Type={event_type}, ID={call_id}, Param={param}")
+
+        # Basic state management (will be refined)
+        if event_type == "CALL_INCOMING":
+            if call_id and param:
+                self.active_sip_calls[call_id] = {"state": "incoming", "remote_uri": param, "id": call_id}
+                logger.info(f"🖥️📞📞 Incoming SIP call (ID: {call_id}) from {param}")
+                if self.on_incoming_call_callback:
+                    # Ensure callback is awaited if it's a coroutine
+                    res = self.on_incoming_call_callback(call_id, param)
+                    if asyncio.iscoroutine(res): await res
+        elif event_type == "CALL_ESTABLISHED":
+            if call_id and call_id in self.active_sip_calls:
+                self.active_sip_calls[call_id]["state"] = "established"
+                logger.info(f"🖥️📞📞 SIP call (ID: {call_id}) established with {self.active_sip_calls[call_id]['remote_uri']}")
+                if self.on_call_established_callback:
+                    res = self.on_call_established_callback(call_id)
+                    if asyncio.iscoroutine(res): await res
+        elif event_type == "CALL_CLOSED":
+            if call_id and call_id in self.active_sip_calls:
+                logger.info(f"🖥️📞📞 SIP call (ID: {call_id}) closed. Reason: {param}")
+                # Call callback before removing, so it can access call details if needed
+                if self.on_call_closed_callback:
+                    res = self.on_call_closed_callback(call_id)
+                    if asyncio.iscoroutine(res): await res
+                del self.active_sip_calls[call_id]
+        # TODO: Handle REGISTER_OK, REGISTER_FAIL, etc.
+
+    async def _ctrl_writer_task(self):
+        if not self.ctrl_writer: return
+        logger.info("🖥️📞 Baresip ctrl_writer_task started.")
+        try:
+            while not self._stop_event.is_set() or not self.command_queue.empty():
+                if self._stop_event.is_set() and self.command_queue.empty():
+                    break # Exit if stop is set and queue is drained
+
+                try:
+                    command = await asyncio.wait_for(self.command_queue.get(), timeout=0.5)
+                except asyncio.TimeoutError:
+                    continue # Check stop_event again
+
+                if command is None: # Sentinel for stopping
+                    self.command_queue.task_done() # Acknowledge sentinel
+                    break
+
+                if self.ctrl_writer.is_closing():
+                    logger.warning(f"🖥️📞 Baresip ctrl_writer is closing. Cannot send command: {command}")
+                    self.command_queue.task_done() # Still mark as done
+                    # Optionally re-queue or handle error
+                    break
+
+                logger.debug(f"🖥️📞 Sending command to Baresip: {command}")
+                self.ctrl_writer.write(f"{command}\n".encode())
+                await self.ctrl_writer.drain()
+                self.command_queue.task_done()
+        except asyncio.CancelledError:
+            logger.info("🖥️📞 Baresip ctrl_writer_task cancelled.")
+        except ConnectionResetError:
+            logger.warning("🖥️📞 Baresip ctrl_tcp connection reset during write.")
+        except Exception as e:
+            logger.error(f"🖥️💥 Error in Baresip ctrl_writer_task: {e}", exc_info=True)
+        finally:
+            logger.info("🖥️📞 Baresip ctrl_writer_task finished.")
+            # Don't close writer here, stop() method will handle it.
+
+    async def send_command(self, command: str):
+        if self._stop_event.is_set() or not self.ctrl_writer or self.ctrl_writer.is_closing():
+            logger.warning(f"🖥️📞 BaresipManager not active or writer closed. Cannot send command: {command}")
+            return
+        await self.command_queue.put(command)
+
+    async def accept_call(self, call_id: Optional[str] = None):
+        # Baresip 'accept' or 'a' command. If call_id is provided and Baresip supports
+        # accepting a specific call ID, that would be better.
+        # Default Baresip 'a' accepts the current/first ringing call.
+        command = "accept" # Check Baresip docs for specific call ID acceptance if needed
+        logger.info(f"🖥️📞 Instructing Baresip to accept call (Target ID: {call_id if call_id else 'any'}). Using command: {command}")
+        await self.send_command(command)
+
+    async def hangup_call(self, call_id: Optional[str] = None):
+        command = "hangup" # General hangup
+        if call_id and call_id in self.active_sip_calls:
+            # Baresip's command is 'h <call_id>' or 'hangup <call_id>'
+            # However, some versions might use 'call_hangup <id>' or similar.
+            # Let's use a common one, assuming it will hang up the specific call if it's the current one.
+            # A more reliable way is to find the specific command for hanging up a call by ID
+            # from Baresip's ctrl_tcp documentation if 'hangup <id>' isn't it.
+            # For now, we'll use the general hangup and if an ID is known, log it.
+            logger.info(f"🖥️📞 Instructing Baresip to hangup call (Known ID: {call_id})")
+        elif not call_id and self.active_sip_calls:
+            active_call_id = next(iter(self.active_sip_calls), None)
+            logger.info(f"🖥️📞 Instructing Baresip to hangup active call (ID: {active_call_id if active_call_id else 'unknown'})")
+        else:
+            logger.info("🖥️📞 Instructing Baresip to hangup current/all calls.")
+        await self.send_command(command)
+
+
+    async def stop(self):
+        if self._stop_event.is_set():
+            return
+        logger.info("🖥️📞 Stopping BaresipManager...")
+        self._stop_event.set()
+
+        # Signal writer task to stop and process remaining queue items
+        if self.command_queue:
+            await self.command_queue.put(None)
+
+        # Cancel control tasks (reader, writer, loggers)
+        for task in self._ctrl_tasks:
+            if not task.done():
+                task.cancel()
+        if self._ctrl_tasks:
+            await asyncio.gather(*self._ctrl_tasks, return_exceptions=True)
+        self._ctrl_tasks = []
+
+        if self.ctrl_writer and not self.ctrl_writer.is_closing():
+            self.ctrl_writer.close()
+            try:
+                await self.ctrl_writer.wait_closed()
+            except Exception as e:
+                logger.warning(f"Error closing ctrl_writer: {e}")
+        self.ctrl_reader = None # Reader task handles its closure or EOF
+
+        if self.process and self.process.returncode is None:
+            logger.info(f"🖥️📞 Terminating Baresip process (PID: {self.process.pid})...")
+            try:
+                self.process.terminate() # SIGTERM
+                await asyncio.wait_for(self.process.wait(), timeout=5.0)
+                logger.info(f"🖥️📞 Baresip process (PID: {self.process.pid}) terminated with code {self.process.returncode}.")
+            except asyncio.TimeoutError:
+                logger.warning(f"🖥️📞 Baresip process (PID: {self.process.pid}) did not terminate gracefully, killing (SIGKILL).")
+                self.process.kill()
+                await self.process.wait()
+                logger.info(f"🖥️📞 Baresip process (PID: {self.process.pid}) killed with code {self.process.returncode}.")
+            except Exception as e: # Catch other potential errors like ProcessLookupError
+                logger.error(f"🖥️💥 Error terminating Baresip process (PID: {self.process.pid if self.process else 'unknown'}): {e}")
+
+        # FIFO cleanup is better handled by the system or on next start if needed,
+        # as other processes might still be using them if Baresip didn't close them.
+        # Forcing removal here can be problematic. Let _create_fifos handle existing ones.
+        logger.info("🖥️📞 BaresipManager stopped.")
+
+# --------------------------------------------------------------------
+# Audio Bridge Class
+# --------------------------------------------------------------------
+class AudioBridge:
+    def __init__(self, loop: asyncio.AbstractEventLoop,
+                 from_sip_fifo_path_str: str, to_sip_fifo_path_str: str,
+                 audio_to_ws_queue: asyncio.Queue, # Python reads from FIFO, puts here for WS
+                 audio_from_ws_queue: asyncio.Queue, # Python gets from here (from WS), writes to FIFO
+                 chunk_size: int = 640 # Default: 20ms of 16kHz 16-bit mono audio (320 samples * 2 bytes/sample)
+                 ):
+        self.loop = loop
+        self.from_sip_fifo_path = os.path.expanduser(from_sip_fifo_path_str)
+        self.to_sip_fifo_path = os.path.expanduser(to_sip_fifo_path_str)
+        self.audio_to_ws_queue = audio_to_ws_queue
+        self.audio_from_ws_queue = audio_from_ws_queue
+        self._stop_event = threading.Event()
+        self.reader_thread: Optional[threading.Thread] = None
+        self.writer_thread: Optional[threading.Thread] = None
+        # CHUNK_SIZE: e.g. 16kHz, 16-bit mono, 20ms chunks -> 16000 * 2 * 0.020 = 640 bytes
+        # This should align with what Baresip is configured to send/receive if possible,
+        # or be a reasonable size for processing.
+        self.CHUNK_SIZE = chunk_size
+        self._reader_fifo_fd: Optional[int] = None
+        self._writer_fifo_fd: Optional[int] = None
+
+
+    def _read_from_sip_fifo_thread(self):
+        logger.info(f"🎧🔊 Starting FIFO reader thread for {self.from_sip_fifo_path}")
+        fifo = None
+        try:
+            # Open in non-blocking mode to allow stop_event checking if FIFO isn't ready,
+            # but os.open then requires more careful read handling.
+            # For simplicity, let's use blocking open first. If Baresip isn't writing, this will block.
+            # This fd is primarily to allow interrupting the read via os.close() in stop()
+            self._reader_fifo_fd = os.open(self.from_sip_fifo_path, os.O_RDONLY)
+            # Now open it as a Python file object for easier reading
+            fifo = open(self._reader_fifo_fd, "rb")
+            logger.info(f"🎧🔊 FIFO {self.from_sip_fifo_path} opened for reading by Python.")
+            while not self._stop_event.is_set():
+                chunk = fifo.read(self.CHUNK_SIZE) # This read can block
+                if not chunk: # EOF
+                    if self._stop_event.is_set(): # Expected if stopping
+                        logger.info(f"🎧🔊 FIFO {self.from_sip_fifo_path} read EOF during stop.")
+                    else: # Unexpected EOF
+                        logger.warning(f"🎧🔊 FIFO {self.from_sip_fifo_path} read EOF. Baresip might have closed.")
+                    break
+                asyncio.run_coroutine_threadsafe(self.audio_to_ws_queue.put(chunk), self.loop)
+        except FileNotFoundError:
+            if not self._stop_event.is_set():
+                logger.error(f"🎧💥 FIFO {self.from_sip_fifo_path} not found for reading.")
+        except OSError as e: # Covers cases like trying to open FIFO not opened for writing yet if O_NONBLOCK was used, or other OS errors
+             if not self._stop_event.is_set():
+                logger.error(f"🎧💥 OSError in FIFO reader thread ({self.from_sip_fifo_path}): {e.strerror} (errno {e.errno})")
+        except Exception as e:
+            if not self._stop_event.is_set():
+                logger.exception(f"🎧💥 Unhandled error in FIFO reader thread ({self.from_sip_fifo_path})")
+        finally:
+            if fifo:
+                try:
+                    fifo.close() # This also closes the fd if it's the only reference
+                except Exception as e:
+                    logger.warning(f"🎧🔊 Error closing reader FIFO file object: {e}")
+            elif self._reader_fifo_fd is not None: # If only fd was opened
+                 try:
+                    os.close(self._reader_fifo_fd)
+                 except Exception as e:
+                    logger.warning(f"🎧🔊 Error closing reader FIFO fd: {e}")
+            self._reader_fifo_fd = None
+            logger.info(f"🎧🔊 FIFO reader thread for {self.from_sip_fifo_path} stopped.")
+
+    def _write_to_sip_fifo_thread(self):
+        logger.info(f"🎧🎤 Starting FIFO writer thread for {self.to_sip_fifo_path}")
+        fifo = None
+        try:
+            self._writer_fifo_fd = os.open(self.to_sip_fifo_path, os.O_WRONLY)
+            fifo = open(self._writer_fifo_fd, "wb")
+            logger.info(f"🎧🎤 FIFO {self.to_sip_fifo_path} opened for writing by Python.")
+            while not self._stop_event.is_set():
+                try:
+                    # Timeout allows checking _stop_event periodically
+                    chunk = self.audio_from_ws_queue.get(timeout=0.1)
+                    if chunk is None: # Sentinel for stopping
+                        self.audio_from_ws_queue.task_done()
+                        break
+
+                    fifo.write(chunk)
+                    fifo.flush() # Ensure it's written immediately
+                    self.audio_from_ws_queue.task_done()
+                except QueueEmpty:
+                    continue
+                except BrokenPipeError:
+                    if not self._stop_event.is_set():
+                        logger.warning(f"🎧🎤 Broken pipe writing to FIFO {self.to_sip_fifo_path}. Baresip might have closed its reading end.")
+                    break # Exit thread if pipe is broken
+                except OSError as e: # Other OS errors related to FIFO
+                    if not self._stop_event.is_set():
+                        logger.error(f"🎧🎤 OSError in FIFO writer thread ({self.to_sip_fifo_path}): {e.strerror} (errno {e.errno})")
+                    break
+
+        except FileNotFoundError:
+            if not self._stop_event.is_set():
+                logger.error(f"🎧💥 FIFO {self.to_sip_fifo_path} not found for writing.")
+        except OSError as e: # Covers cases like trying to open FIFO not opened for reading yet if O_NONBLOCK was used
+             if not self._stop_event.is_set():
+                logger.error(f"🎧💥 OSError opening FIFO writer ({self.to_sip_fifo_path}): {e.strerror} (errno {e.errno})")
+        except Exception as e:
+            if not self._stop_event.is_set():
+                 logger.exception(f"🎧💥 Unhandled error in FIFO writer thread ({self.to_sip_fifo_path})")
+        finally:
+            if fifo:
+                try:
+                    fifo.close()
+                except Exception as e:
+                    logger.warning(f"🎧🎤 Error closing writer FIFO file object: {e}")
+            elif self._writer_fifo_fd is not None:
+                 try:
+                    os.close(self._writer_fifo_fd)
+                 except Exception as e:
+                    logger.warning(f"🎧🎤 Error closing writer FIFO fd: {e}")
+            self._writer_fifo_fd = None
+            logger.info(f"🎧🎤 FIFO writer thread for {self.to_sip_fifo_path} stopped.")
+
+    def start(self):
+        if self.reader_thread and self.reader_thread.is_alive() or \
+           self.writer_thread and self.writer_thread.is_alive():
+            logger.warning("🎧🌉 AudioBridge threads already running. Not starting again.")
+            return
+
+        self._stop_event.clear()
+        self.reader_thread = threading.Thread(target=self._read_from_sip_fifo_thread, name="AudioBridge-Reader", daemon=True)
+        self.writer_thread = threading.Thread(target=self._write_to_sip_fifo_thread, name="AudioBridge-Writer", daemon=True)
+        self.reader_thread.start()
+        self.writer_thread.start()
+        logger.info("🎧🌉 AudioBridge started with FIFO reader/writer threads.")
+
+    def stop(self):
+        logger.info("🎧🌉 Stopping AudioBridge...")
+        self._stop_event.set()
+
+        # Unblock writer thread by putting sentinel
+        if self.writer_thread and self.writer_thread.is_alive():
+            try:
+                # No need for run_coroutine_threadsafe, this is called from main thread or asyncio task usually
+                self.audio_from_ws_queue.put_nowait(None)
+            except asyncio.QueueFull: # Should not happen with sentinel if queue has space
+                logger.warning("🎧🌉 AudioBridge: Writer queue full, couldn't place sentinel immediately.")
+            except Exception as e:
+                 logger.warning(f"🎧🌉 AudioBridge: Error putting sentinel to writer queue: {e}")
+
+
+        # Attempt to interrupt blocking os.read() in reader_thread
+        # This is a bit hacky and platform-dependent.
+        # Closing the file descriptor from another thread can cause read() to return an error.
+        if self._reader_fifo_fd is not None:
+            try:
+                logger.info(f"🎧🌉 Attempting to close reader FIFO fd {self._reader_fifo_fd} to unblock thread.")
+                os.close(self._reader_fifo_fd) # This should make fifo.read() in thread raise OSError or return EOF
+            except OSError as e:
+                logger.warning(f"🎧🌉 Error closing reader FIFO fd during stop: {e}")
+            # self._reader_fifo_fd = None # fd is closed now
+
+        if self.reader_thread and self.reader_thread.is_alive():
+            self.reader_thread.join(timeout=2.0)
+            if self.reader_thread.is_alive():
+                logger.warning(f"🎧🔊 FIFO reader thread for {self.from_sip_fifo_path} did not stop cleanly via join.")
+
+        if self.writer_thread and self.writer_thread.is_alive():
+            self.writer_thread.join(timeout=2.0)
+            if self.writer_thread.is_alive():
+                 logger.warning(f"🎧🎤 FIFO writer thread for {self.to_sip_fifo_path} did not stop cleanly via join.")
+        logger.info("🎧🌉 AudioBridge stopped.")
 
 # --------------------------------------------------------------------
 # Custom no-cache StaticFiles
@@ -137,9 +614,90 @@ async def lifespan(app: FastAPI):
     logger.info("🖥️⏹️ Server shutting down")
     app.state.AudioInputProcessor.shutdown()
 
+    # Stop BaresipManager and AudioBridge
+    if hasattr(app.state, 'AudioBridgeInstance') and app.state.AudioBridgeInstance:
+        logger.info("🖥️⏹️ Stopping AudioBridge...")
+        app.state.AudioBridgeInstance.stop()
+    if hasattr(app.state, 'BaresipManagerInstance') and app.state.BaresipManagerInstance:
+        logger.info("🖥️⏹️ Stopping BaresipManager...")
+        await app.state.BaresipManagerInstance.stop()
+
 # --------------------------------------------------------------------
-# FastAPI app instance
+# FastAPI app instance and global state for SIP
 # --------------------------------------------------------------------
+class SIPWebSocketAppState:
+    def __init__(self):
+        self.active_websocket_for_sip: Optional[WebSocket] = None
+        self.active_websocket_message_queue: Optional[asyncio.Queue] = None
+
+# Lifespan manager
+@asynccontextmanager
+async def lifespan(app_fastapi: FastAPI): # Renamed app to app_fastapi to avoid conflict
+    logger.info("🖥️▶️ Server starting up")
+    loop = asyncio.get_running_loop()
+
+    # Initialize global app state for SIP WebSocket management
+    app_fastapi.state.sip_ws_app_state = SIPWebSocketAppState()
+
+    # Initialize existing components
+    app_fastapi.state.SpeechPipelineManager = SpeechPipelineManager(
+        tts_engine=TTS_START_ENGINE,
+        llm_provider=LLM_START_PROVIDER,
+        llm_model=LLM_START_MODEL,
+        no_think=NO_THINK,
+        orpheus_model=TTS_ORPHEUS_MODEL,
+    )
+    app_fastapi.state.Upsampler = UpsampleOverlap()
+    app_fastapi.state.AudioInputProcessor = AudioInputProcessor(
+        LANGUAGE,
+        is_orpheus=TTS_START_ENGINE=="orpheus",
+        pipeline_latency=app_fastapi.state.SpeechPipelineManager.full_output_pipeline_latency / 1000, # seconds
+    )
+    app_fastapi.state.Aborting = False
+
+    # Initialize BaresipManager
+    app_fastapi.state.BaresipManagerInstance = BaresipManager(app_fastapi.state, loop)
+    asyncio.create_task(app_fastapi.state.BaresipManagerInstance.start())
+
+    # Initialize AudioBridge related queues
+    app_fastapi.state.sip_audio_to_ws_queue = asyncio.Queue()  # Audio from Baresip (SIP) to WebSocket
+    app_fastapi.state.sip_audio_from_ws_queue = asyncio.Queue() # Audio from WebSocket to Baresip (SIP)
+
+    # Calculate chunk size for AudioBridge based on SIP audio settings (e.g., for 20ms packets)
+    # Samples per chunk = sample_rate * packet_duration_ms / 1000
+    # Bytes per chunk = samples_per_chunk * bytes_per_sample (L16 is 2 bytes)
+    sip_packet_duration_ms = 20
+    samples_per_chunk = int(SIP_AUDIO_SAMPLE_RATE * (sip_packet_duration_ms / 1000.0))
+    bytes_per_sample = 2 # For L16 (16-bit PCM)
+    audio_bridge_chunk_size = samples_per_chunk * bytes_per_sample
+
+    app_fastapi.state.AudioBridgeInstance = AudioBridge(
+        loop,
+        BARESIP_AUDIO_FROM_SIP_FIFO,
+        BARESIP_AUDIO_TO_SIP_FIFO,
+        app_fastapi.state.sip_audio_to_ws_queue,
+        app_fastapi.state.sip_audio_from_ws_queue,
+        chunk_size=audio_bridge_chunk_size
+    )
+    # AudioBridge will be started/stopped by BaresipManager based on call state typically,
+    # or started here if it should always run. For now, let BaresipManager callbacks handle it.
+    # app_fastapi.state.AudioBridgeInstance.start()
+
+    yield
+
+    logger.info("🖥️⏹️ Server shutting down")
+    # Stop BaresipManager and AudioBridge first
+    if hasattr(app_fastapi.state, 'AudioBridgeInstance') and app_fastapi.state.AudioBridgeInstance:
+        logger.info("🖥️⏹️ Stopping AudioBridge...")
+        app_fastapi.state.AudioBridgeInstance.stop() # This is synchronous
+    if hasattr(app_fastapi.state, 'BaresipManagerInstance') and app_fastapi.state.BaresipManagerInstance:
+        logger.info("🖥️⏹️ Stopping BaresipManager...")
+        await app_fastapi.state.BaresipManagerInstance.stop() # This is asynchronous
+
+    if hasattr(app_fastapi.state, 'AudioInputProcessor') and app_fastapi.state.AudioInputProcessor:
+        app_fastapi.state.AudioInputProcessor.shutdown()
+    # Other cleanup if necessary
+
 app = FastAPI(lifespan=lifespan)
 
 # Enable CORS if needed
@@ -177,6 +735,63 @@ async def get_index() -> HTMLResponse:
     with open("static/index.html", "r", encoding="utf-8") as f:
         html_content = f.read()
     return HTMLResponse(content=html_content)
+
+# --------------------------------------------------------------------
+# Audio Utilities (including Transcoding Placeholders)
+# --------------------------------------------------------------------
+def resample_audio_placeholder(pcm_data: bytes, input_rate: int, output_rate: int, num_channels: int = 1, sample_width: int = 2) -> bytes:
+    """
+    Placeholder for audio resampling.
+    In a real implementation, use a library like librosa, scipy.signal.resample,
+    soundfile, or ffmpeg.
+    This placeholder will just return the data if rates match, otherwise log a warning
+    and return the original data. A proper implementation is crucial for audio quality.
+    """
+    if input_rate == output_rate:
+        return pcm_data
+
+    logger.warning(
+        f"Audio resampling placeholder: Attempting to convert from {input_rate}Hz to {output_rate}Hz. "
+        f"NO ACTUAL RESAMPLING IS PERFORMED by this placeholder. Audio will likely be speed up/slowed down or distorted. "
+        f"Implement proper resampling using a library like librosa, scipy.signal, or by calling ffmpeg."
+    )
+
+    # Crude example: if downsampling 48k -> 16k, factor = 3. Take 1 sample, skip 2.
+    # This is NOT a quality resampling method.
+    if input_rate > output_rate and input_rate % output_rate == 0:
+        factor = input_rate // output_rate
+        output_pcm = bytearray()
+        frame_size = num_channels * sample_width
+        num_frames = len(pcm_data) // frame_size
+        for i in range(num_frames):
+            if i % factor == 0:
+                output_pcm.extend(pcm_data[i*frame_size : (i+1)*frame_size])
+        logger.info(f"Crude downsample applied: original bytes {len(pcm_data)}, new bytes {len(output_pcm)}")
+        return bytes(output_pcm)
+
+    # Crude example: if upsampling 16k -> 48k, factor = 3. Repeat each sample 3 times.
+    # This is also NOT a quality resampling method.
+    elif output_rate > input_rate and output_rate % input_rate == 0:
+        factor = output_rate // input_rate
+        output_pcm = bytearray()
+        frame_size = num_channels * sample_width
+        num_frames = len(pcm_data) // frame_size
+        for i in range(num_frames):
+            frame = pcm_data[i*frame_size : (i+1)*frame_size]
+            for _ in range(factor):
+                output_pcm.extend(frame)
+        logger.info(f"Crude upsample applied: original bytes {len(pcm_data)}, new bytes {len(output_pcm)}")
+        return bytes(output_pcm)
+
+    # Fallback for non-integer factors or if no crude method applies
+    return pcm_data
+
+
+# Placeholder for target WebSocket audio format (client-side often uses higher rates)
+WS_CLIENT_SAMPLE_RATE = int(os.getenv("WS_CLIENT_SAMPLE_RATE", 48000)) # e.g., 48kHz often used by browsers
+WS_CLIENT_CHANNELS = 1
+WS_CLIENT_SAMPLE_WIDTH = 2 # Bytes, e.g., 2 for 16-bit PCM
+
 
 # --------------------------------------------------------------------
 # Utility functions
@@ -872,6 +1487,7 @@ class TranscriptionCallbacks:
 # --------------------------------------------------------------------
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
+    app_state = app.state # Shortcut to app.state for convenience
     """
     Handles the main WebSocket connection for real-time voice chat.
 
@@ -905,36 +1521,262 @@ async def websocket_endpoint(ws: WebSocket):
     app.state.AudioInputProcessor.silence_active_callback = callbacks.on_silence_active
 
     # Assign callback to the SpeechPipelineManager (global component)
-    app.state.SpeechPipelineManager.on_partial_assistant_text = callbacks.on_partial_assistant_text
+    app_state.SpeechPipelineManager.on_partial_assistant_text = callbacks.on_partial_assistant_text
+
+    # --- SIP Integration: Manage active WebSocket for SIP ---
+    # For now, the latest connecting WebSocket client will handle SIP interactions.
+    # This is a simplification; a robust app might have dedicated SIP handling clients or UIs.
+    app_state.sip_ws_app_state.active_websocket_for_sip = ws
+    app_state.sip_ws_app_state.active_websocket_message_queue = client_message_queue
+    logger.info(f"🖥️📞 WebSocket {ws.client.host}:{ws.client.port} is now the active handler for SIP events.")
+
+    bm = app_state.BaresipManagerInstance if hasattr(app_state, 'BaresipManagerInstance') else None
+    ab = app_state.AudioBridgeInstance if hasattr(app_state, 'AudioBridgeInstance') else None
+
+    if bm:
+        async def handle_incoming_sip_call(call_id: str, remote_uri: str):
+            logger.info(f"🖥️📞 Relaying incoming SIP call {call_id} from {remote_uri} to active WebSocket client.")
+            if app_state.sip_ws_app_state.active_websocket_message_queue:
+                await app_state.sip_ws_app_state.active_websocket_message_queue.put({
+                    "type": "sip_event",
+                    "event": "incoming_call",
+                    "call_id": call_id,
+                    "remote_uri": remote_uri
+                })
+        bm.on_incoming_call_callback = handle_incoming_sip_call
+
+        async def handle_sip_call_established(call_id: str):
+            logger.info(f"🖥️📞 Relaying SIP call established {call_id} to active WebSocket client.")
+            if app_state.sip_ws_app_state.active_websocket_message_queue:
+                await app_state.sip_ws_app_state.active_websocket_message_queue.put({
+                    "type": "sip_event",
+                    "event": "call_established",
+                    "call_id": call_id
+                })
+            if ab: # Start AudioBridge if a call is established
+                if not (ab.reader_thread and ab.reader_thread.is_alive()): # Check if already running
+                    logger.info(f"🎧🌉 AudioBridge starting for SIP call {call_id}.")
+                    ab.start()
+                else:
+                    logger.info(f"🎧🌉 AudioBridge already running, not restarting for call {call_id}.")
+
+        bm.on_call_established_callback = handle_sip_call_established
+
+        async def handle_sip_call_closed(call_id: str):
+            logger.info(f"🖥️📞 Relaying SIP call closed {call_id} to active WebSocket client.")
+            if app_state.sip_ws_app_state.active_websocket_message_queue:
+                await app_state.sip_ws_app_state.active_websocket_message_queue.put({
+                    "type": "sip_event",
+                    "event": "call_closed",
+                    "call_id": call_id
+                })
+            # Stop AudioBridge if this was the only call (simplified logic)
+            if ab and bm and not bm.active_sip_calls: # Check if BaresipManager has any other active calls
+                 if ab.reader_thread and ab.reader_thread.is_alive(): # Check if running
+                    logger.info(f"🎧🌉 AudioBridge stopping as SIP call {call_id} closed and no other calls active.")
+                    ab.stop()
+            elif ab and bm and bm.active_sip_calls:
+                logger.info(f"🎧🌉 AudioBridge not stopping as other SIP calls ({len(bm.active_sip_calls)}) are still active.")
+
+        bm.on_call_closed_callback = handle_sip_call_closed
+
+    # --- Task to send SIP audio (from Baresip via AudioBridge) to this WebSocket client ---
+    async def send_sip_audio_to_websocket_task():
+        if not (hasattr(app_state, 'sip_audio_to_ws_queue') and app_state.sip_audio_to_ws_queue):
+            logger.warning("send_sip_audio_to_websocket_task: sip_audio_to_ws_queue not found.")
+            return
+
+        sip_q_to_ws = app_state.sip_audio_to_ws_queue
+        active_sip_calls_exist = lambda: bm and bm.active_sip_calls
+
+        try:
+            while True:
+                if not active_sip_calls_exist() or not (ab and ab.reader_thread and ab.reader_thread.is_alive()):
+                    await asyncio.sleep(0.1) # Sleep if no active SIP calls or AudioBridge not running
+                    continue
+
+                try:
+                    pcm_chunk = await asyncio.wait_for(sip_q_to_ws.get(), timeout=0.1)
+                except asyncio.TimeoutError:
+                    continue # Check conditions again
+
+                if pcm_chunk is None: # Sentinel not expected here, but good practice
+                    break
+
+                # Transcode from SIP audio format (L16/16kHz) to WebSocket client format
+                transcoded_for_ws = resample_audio_placeholder(
+                    pcm_chunk,
+                    input_rate=SIP_AUDIO_SAMPLE_RATE,
+                    output_rate=WS_CLIENT_SAMPLE_RATE, # Client might prefer a different rate
+                    num_channels=SIP_AUDIO_CHANNELS,   # Baresip FIFOs are mono
+                    sample_width=2                     # L16 is 16-bit (2 bytes)
+                )
+
+                # Assuming client expects Base64 encoded PCM for audio chunks
+                base64_chunk = base64.b64encode(transcoded_for_ws).decode('utf-8')
+                # Use the specific client_message_queue for this WebSocket connection
+                await client_message_queue.put({
+                    "type": "sip_audio_chunk",
+                    "content": base64_chunk
+                })
+                sip_q_to_ws.task_done()
+        except asyncio.CancelledError:
+            logger.info("🖥️🔊 SIP audio to WebSocket task cancelled.")
+        except Exception as e:
+            logger.error(f"🖥️💥 Error in SIP audio to WebSocket task: {e}", exc_info=True)
+        finally:
+            logger.info("🖥️🔊 SIP audio to WebSocket task finished.")
+
+    # --- Wrapped process_incoming_data to handle SIP commands and route audio ---
+    async def process_incoming_ws_data_wrapper(
+            websocket: WebSocket,
+            # app_fastapi: FastAPI, # app_state is used directly
+            audio_q_for_stt: asyncio.Queue,
+            cb_stt: TranscriptionCallbacks):
+
+        sip_audio_q_to_baresip = app_state.sip_audio_from_ws_queue if hasattr(app_state, 'sip_audio_from_ws_queue') else None
+
+        try:
+            while True:
+                msg = await websocket.receive()
+                # Check if this WebSocket is currently handling an active SIP call
+                # This relies on bm.active_sip_calls reflecting the state of calls Baresip is handling.
+                is_sip_call_active_for_this_ws = bm and bm.active_sip_calls and \
+                                                 (app_state.sip_ws_app_state.active_websocket_for_sip == websocket)
+
+
+                if "bytes" in msg and msg["bytes"]:
+                    raw_audio_from_ws = msg["bytes"]
+                    # Assuming standard 8-byte header for all incoming audio for now
+                    if len(raw_audio_from_ws) < 8:
+                        logger.warning("🖥️⚠️ Received packet too short for 8‑byte header.")
+                        continue
+
+                    client_timestamp_ms, flags = struct.unpack("!II", raw_audio_from_ws[:8])
+                    pcm_payload = raw_audio_from_ws[8:]
+
+                    if is_sip_call_active_for_this_ws and sip_audio_q_to_baresip and \
+                       (ab and ab.writer_thread and ab.writer_thread.is_alive()):
+
+                        # Transcode from WebSocket client format to SIP format (L16/16kHz)
+                        transcoded_for_sip = resample_audio_placeholder(
+                            pcm_payload,
+                            input_rate=WS_CLIENT_SAMPLE_RATE, # Assuming client sends at this rate
+                            output_rate=SIP_AUDIO_SAMPLE_RATE,
+                            num_channels=WS_CLIENT_CHANNELS, # Assuming client sends mono
+                            sample_width=WS_CLIENT_SAMPLE_WIDTH # Assuming 16-bit
+                        )
+                        await sip_audio_q_to_baresip.put(transcoded_for_sip)
+                    else:
+                        # Not in an active SIP call for this WS, or SIP components not ready,
+                        # so route to existing STT pipeline.
+                        # Reconstruct metadata for STT pipeline.
+                        metadata_for_stt = {
+                            "client_sent_ms": client_timestamp_ms,
+                            "client_sent": client_timestamp_ms * 1_000_000,
+                            "isTTSPlaying": bool(flags & 1), # Example flag
+                            "pcm": pcm_payload,
+                            "server_received": time.time_ns(),
+                            # Add other fields expected by AudioInputProcessor.process_chunk_queue
+                        }
+                        metadata_for_stt["client_sent_formatted"] = format_timestamp_ns(metadata_for_stt["client_sent"])
+                        metadata_for_stt["server_received_formatted"] = format_timestamp_ns(metadata_for_stt["server_received"])
+
+                        current_qsize = audio_q_for_stt.qsize()
+                        if current_qsize < MAX_AUDIO_QUEUE_SIZE:
+                            await audio_q_for_stt.put(metadata_for_stt)
+                        else:
+                            logger.warning(
+                                f"🖥️⚠️ STT Audio queue full ({current_qsize}/{MAX_AUDIO_QUEUE_SIZE}); dropping chunk."
+                            )
+
+                elif "text" in msg and msg["text"]:
+                    data = parse_json_message(msg["text"])
+                    msg_type = data.get("type")
+                    logger.info(Colors.apply(f"🖥️📥 ←←Client (WS Text): {data}").orange)
+
+                    if bm: # Ensure BaresipManager is available
+                        if msg_type == "answer_sip_call":
+                            call_id_to_answer = data.get("call_id") # Client should provide this from 'sip_event'
+                            logger.info(f"🖥️📞 WS Client requests to answer SIP call: {call_id_to_answer if call_id_to_answer else 'any'}")
+                            await bm.accept_call(call_id_to_answer)
+                        elif msg_type == "hangup_sip_call":
+                            call_id_to_hangup = data.get("call_id")
+                            logger.info(f"🖥️📞 WS Client requests to hangup SIP call: {call_id_to_hangup if call_id_to_hangup else 'current'}")
+                            await bm.hangup_call(call_id_to_hangup)
+                        # --- Pass to existing STT/TTS related text message handler ---
+                        elif msg_type == "tts_start": cb_stt.tts_client_playing = True
+                        elif msg_type == "tts_stop": cb_stt.tts_client_playing = False
+                        elif msg_type == "clear_history": app_state.SpeechPipelineManager.reset()
+                        elif msg_type == "set_speed":
+                            speed_value = data.get("speed", 0)
+                            speed_factor = speed_value / 100.0
+                            turn_detection = app_state.AudioInputProcessor.transcriber.turn_detection
+                            if turn_detection:
+                                turn_detection.update_settings(speed_factor)
+                                logger.info(f"🖥️⚙️ Updated turn detection settings to factor: {speed_factor:.2f}")
+                        else:
+                            logger.warning(f"Unhandled text message type from client: {msg_type}")
+                    else:
+                         logger.warning(f"BaresipManager not available, ignoring SIP command: {msg_type}")
+
+
+        except asyncio.CancelledError:
+            logger.info(f"process_incoming_ws_data_wrapper for {websocket.client} cancelled.")
+        except WebSocketDisconnect as e:
+            logger.warning(f"🖥️⚠️ WS disconnect for {websocket.client} in process_incoming_ws_data_wrapper: {repr(e)}")
+        except Exception as e:
+            logger.exception(f"🖥️💥 EXCEPTION in process_incoming_ws_data_wrapper for {websocket.client}: {repr(e)}")
+
 
     # Create tasks for handling different responsibilities
     # Pass the 'callbacks' instance to tasks that need connection-specific state
-    tasks = [
-        asyncio.create_task(process_incoming_data(ws, app, audio_chunks, callbacks)), # Pass callbacks
-        asyncio.create_task(app.state.AudioInputProcessor.process_chunk_queue(audio_chunks)),
-        asyncio.create_task(send_text_messages(ws, message_queue)),
-        asyncio.create_task(send_tts_chunks(app, message_queue, callbacks)), # Pass callbacks
+    all_tasks = [
+        # Wrapped incoming data processor
+        asyncio.create_task(process_incoming_ws_data_wrapper(ws, audio_chunks, callbacks)),
+        # Existing tasks for STT/TTS pipeline
+        asyncio.create_task(app_state.AudioInputProcessor.process_chunk_queue(audio_chunks)),
+        asyncio.create_task(send_text_messages(ws, client_message_queue)), # client_message_queue now gets SIP events too
+        asyncio.create_task(send_tts_chunks(app_state, client_message_queue, callbacks)),
+        # New task for sending SIP audio (from Baresip) to this client
+        asyncio.create_task(send_sip_audio_to_websocket_task()),
     ]
 
     try:
         # Wait for any task to complete (e.g., client disconnect)
-        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-        for task in pending:
-            if not task.done():
-                task.cancel()
+        done, pending = await asyncio.wait(all_tasks, return_when=asyncio.FIRST_COMPLETED)
+        for task_to_cancel in pending: # Corrected variable name
+            if not task_to_cancel.done():
+                task_to_cancel.cancel()
         # Await cancelled tasks to let them clean up if needed
-        await asyncio.gather(*pending, return_exceptions=True)
+        if pending: # Only gather if there are pending tasks
+            await asyncio.gather(*pending, return_exceptions=True)
     except Exception as e:
-        logger.error(f"🖥️💥 {Colors.apply('ERROR').red} in WebSocket session: {repr(e)}")
+        logger.error(f"🖥️💥 {Colors.apply('ERROR').red} in WebSocket session main task loop: {repr(e)}")
     finally:
-        logger.info("🖥️🧹 Cleaning up WebSocket tasks...")
-        for task in tasks:
-            if not task.done():
-                task.cancel()
+        logger.info(f"🖥️🧹 Cleaning up WebSocket tasks for client {ws.client}...")
+        for task_to_clean in all_tasks: # Corrected variable name
+            if not task_to_clean.done():
+                task_to_clean.cancel()
         # Ensure all tasks are awaited after cancellation
-        # Use return_exceptions=True to prevent gather from stopping on first error during cleanup
-        await asyncio.gather(*tasks, return_exceptions=True)
-        logger.info("🖥️❌ WebSocket session ended.")
+        await asyncio.gather(*all_tasks, return_exceptions=True)
+
+        # --- SIP Integration: Cleanup for this WebSocket client ---
+        if app_state.sip_ws_app_state.active_websocket_for_sip == ws:
+            logger.info(f"🖥️📞 WebSocket client {ws.client} (was SIP handler) disconnected. Clearing SIP handler.")
+            app_state.sip_ws_app_state.active_websocket_for_sip = None
+            app_state.sip_ws_app_state.active_websocket_message_queue = None
+            # Clear BaresipManager callbacks if they were set for this specific client's context
+            # This is important if callbacks capture 'ws' or 'client_message_queue'
+            if bm:
+                # A more robust way would be to use functools.partial or classes for callbacks
+                # to avoid direct comparison of function objects if they are dynamically created.
+                # For now, assuming they are the ones set above.
+                if bm.on_incoming_call_callback == handle_incoming_sip_call: bm.on_incoming_call_callback = None
+                if bm.on_call_established_callback == handle_sip_call_established: bm.on_call_established_callback = None
+                if bm.on_call_closed_callback == handle_sip_call_closed: bm.on_call_closed_callback = None
+
+        logger.info(f"🖥️❌ WebSocket session ended for client {ws.client}.")
 
 # --------------------------------------------------------------------
 # Entry point
